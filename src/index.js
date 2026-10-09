@@ -10,9 +10,17 @@
  *     the preset scope and hides the named tools for every agent under it:
  *     the schemas leave the model context AND calls to them resolve as
  *     `UNKNOWN_TOOL`. This is the designed control point.
- *  2. Fallback `system-prompt/assemble` waterfall listener — only used when
- *     `restrict` is unavailable (e.g. an unscoped host mount). It strips the
- *     hidden schemas from the assembled prompt so the model stops seeing them.
+ *  2. `system-prompt/assemble` waterfall listener — always registered, and the
+ *     only path that works when `restrict` is unavailable (an unscoped host
+ *     mount, e.g. the row this bundle's patch inserts at the root composition).
+ *     It strips the hidden schemas from the assembled prompt so the model stops
+ *     seeing them, and records every schema the assembly offers.
+ *
+ * Catalog: the settings page lists `tools.schemas()` ∪ observed assemblies ∪
+ * the persisted hidden set. The second term matters because the web surface
+ * mounts its own model-facing rows inside per-session agent presets, so a
+ * root-mounted plugin's global registry view no longer contains them; the
+ * assembled prompt is the only view that sees every tool a model is offered.
  *
  * Surface:
  *  - model tool `tool_visibility` (list / hide / show / reset);
@@ -65,6 +73,16 @@ export async function apply(ctx, config = {}) {
   const hidden = new Set();
   /** Tool-name → description cache, kept for hidden tools so the UI can show them. */
   const descriptions = new Map();
+  /**
+   * Tool-name → description cache built from every assembled prompt. The global
+   * registry view is NOT the whole catalog once tools live on more than one
+   * plane (the web surface mounts its model-facing rows inside per-session
+   * agent presets), so the assemble waterfall is the one view that sees every
+   * tool a model is actually offered (`assembly.tools` = the request's `tools`
+   * field). Observation is what lets the settings page list — and therefore
+   * toggle — those preset-plane tools.
+   */
+  const observed = new Map();
   /** 'restrict' | 'waterfall' | 'none' — which filter actually applies. */
   let filterMode = 'none';
   let lift = null; // disposer of the active registry restriction
@@ -127,11 +145,20 @@ export async function apply(ctx, config = {}) {
   }
 
   // ── filtering ──────────────────────────────────────────────────────────────
-  // Fallback listener, registered lazily and only when `restrict` is not
-  // usable from the mounting scope. Removes hidden schemas from the assembled
-  // prompt (the exact list that becomes the model request's `tools` field).
+  // One `system-prompt/assemble` listener does both jobs: it records the tool
+  // schemas the model is about to be offered (the catalog's only complete
+  // source), and, when `restrict` is unusable from the mounting scope, it
+  // removes the hidden schemas from that same list. It is registered eagerly
+  // because recording must happen even while nothing is hidden — otherwise a
+  // tool that never appears in the global registry view could never be
+  // discovered by the UI, and so could never be hidden at all.
   let waterfallRegistered = false;
   const waterfall = async (assembly, _context, next) => {
+    for (const tool of Array.isArray(assembly?.tools) ? assembly.tools : []) {
+      if (tool !== null && typeof tool === 'object' && typeof tool.name === 'string') {
+        observed.set(tool.name, typeof tool.description === 'string' ? tool.description : '');
+      }
+    }
     if (hidden.size === 0) return next();
     const result = await next();
     return { ...result, tools: result.tools.filter((tool) => !hidden.has(tool.name)) };
@@ -150,17 +177,17 @@ export async function apply(ctx, config = {}) {
       lift = null;
     }
     const deny = [...hidden].filter((entry) => entry !== MANAGER_TOOL);
-    if (deny.length === 0) {
-      filterMode = hidden.size === 0 ? 'none' : filterMode;
-      return;
+    if (deny.length > 0) {
+      try {
+        lift = ctx.tools.restrict({ deny });
+        filterMode = 'restrict';
+        return;
+      } catch {
+        // Unscoped host mount, or a name this scope may not restrict: the
+        // assemble waterfall above carries the filter instead.
+      }
     }
-    try {
-      lift = ctx.tools.restrict({ deny });
-      filterMode = 'restrict';
-    } catch {
-      ensureWaterfall();
-      filterMode = 'waterfall';
-    }
+    filterMode = deny.length > 0 ? 'waterfall' : 'none';
   }
 
   // ── shared state helpers ───────────────────────────────────────────────────
@@ -168,14 +195,24 @@ export async function apply(ctx, config = {}) {
   const visibleSchemas = (exec) => ctx.tools.schemas(scopeFor(exec));
 
   /**
-   * Complete tool catalog for the UI: visible schemas ∪ hidden names.
-   * Hidden tools vanish from `schemas()` under `restrict`, so the UI must
-   * merge them back (from the state cache) or they could never be re-shown.
+   * Complete tool catalog for the UI: visible schemas ∪ observed assemblies ∪
+   * hidden names.
+   *
+   * Two registries have to be merged back in, for two different reasons:
+   *  - hidden tools vanish from `schemas()` under `restrict` (and from the
+   *    assembled prompt), so the UI must restore them from the state cache or
+   *    they could never be re-shown;
+   *  - tools registered on another plane (an agent preset's own rows) never
+   *    appear in the global registry view at all, so the only source for them
+   *    is what the assemble waterfall has seen the model being offered.
    */
   const catalogFor = (exec) => {
     const byName = new Map();
     for (const schema of visibleSchemas(exec)) {
       byName.set(schema.name, typeof schema.description === 'string' ? schema.description : '');
+    }
+    for (const [name, description] of observed) {
+      if (!byName.has(name)) byName.set(name, description);
     }
     for (const name of hidden) {
       if (!byName.has(name)) byName.set(name, descriptions.get(name) ?? '');
@@ -202,7 +239,8 @@ export async function apply(ctx, config = {}) {
     if (hide) {
       hidden.add(name);
       const schema = visibleSchemas(exec).find((entry) => entry.name === name);
-      if (schema && typeof schema.description === 'string') descriptions.set(name, schema.description);
+      const description = schema?.description ?? observed.get(name);
+      if (typeof description === 'string') descriptions.set(name, description);
     } else {
       hidden.delete(name);
       descriptions.delete(name);
@@ -438,6 +476,9 @@ export async function apply(ctx, config = {}) {
   });
 
   // ── start with persisted state ─────────────────────────────────────────────
+  // The assemble listener is registered before any state exists: it is the
+  // catalog's only source for tools registered outside the global view.
+  ensureWaterfall();
   await load();
   applyFilter();
 }
