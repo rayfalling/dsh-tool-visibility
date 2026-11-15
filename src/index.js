@@ -4,23 +4,24 @@
  * Control which tool schemas are injected into the DeepSeek Harness model
  * context, with a settings-page UI and a model-facing manager tool.
  *
- * Mechanism (framework-native first):
- *  1. `ctx.tools.restrict({ deny })` — the ToolRuntime's per-scope visibility
- *     filter. Mounted as an agent-preset row, the restriction is registered in
- *     the preset scope and hides the named tools for every agent under it:
- *     the schemas leave the model context AND calls to them resolve as
- *     `UNKNOWN_TOOL`. This is the designed control point.
- *  2. `system-prompt/assemble` waterfall listener — always registered, and the
- *     only path that works when `restrict` is unavailable (an unscoped host
- *     mount, e.g. the row this bundle's patch inserts at the root composition).
- *     It strips the hidden schemas from the assembled prompt so the model stops
- *     seeing them, and records every schema the assembly offers.
+ * Mechanism (framework-native):
+ *  `ctx.tools.restrict({ deny })` is the ToolRuntime's per-scope visibility
+ *  filter: hidden schemas leave the model context AND calls to them resolve as
+ *  `UNKNOWN_TOOL`. Since dsh 0.2.2-rc.3 a restriction must be registered from a
+ *  scoped context (a root registration is rejected) and the
+ *  `system-prompt/assemble` waterfall no longer receives the tool array at all
+ *  — tool declarations are provider-owned and appended after it. The filter is
+ *  therefore installed on each live agent's context, discovered through
+ *  `agent/created`: a restriction registered there covers the global and
+ *  agent-preset tools that agent can see, and its lifetime is the agent's.
+ *  Event admission is scope-filtered, so a preset-mounted row filters that
+ *  preset's agents while the root-mounted bundle row filters every agent.
  *
- * Catalog: the settings page lists `tools.schemas()` ∪ observed assemblies ∪
- * the persisted hidden set. The second term matters because the web surface
- * mounts its own model-facing rows inside per-session agent presets, so a
- * root-mounted plugin's global registry view no longer contains them; the
- * assembled prompt is the only view that sees every tool a model is offered.
+ * Catalog: the settings page lists the mounting scope's `tools.schemas()` ∪
+ * every live agent's view (`tools.schemas(agent)` — the agent object is its own
+ * scope key) ∪ the persisted hidden set. The per-agent term is what exposes
+ * preset-plane tools: the web surface mounts its model-facing rows inside
+ * per-session agent presets, so the global registry view does not contain them.
  *
  * Surface:
  *  - model tool `tool_visibility` (list / hide / show / reset);
@@ -30,12 +31,12 @@
  *
  * Dependency policy: this host entry performs NO static `@deepseek-ai/*`
  * imports. The runtime provides everything through injected services
- * (`ctx.tools`, `ctx.systemPrompt`, `ctx.connection`), so the package loads in
- * any profile where the dsh runtime itself runs — third-party bundles cannot
- * rely on `@deepseek-ai/*` resolving from the profile's node_modules (built-ins
- * resolve only from the dsh install). `@deepseek-ai/dsh-scope` is loaded
- * dynamically as an optional upgrade for scope-aware tool views and degrades
- * to the global registry view when absent.
+ * (`ctx.tools`, `ctx.connection`), so the package loads in any profile where the
+ * dsh runtime itself runs — third-party bundles cannot rely on `@deepseek-ai/*`
+ * resolving from the profile's node_modules (built-ins resolve only from the
+ * dsh install). `@deepseek-ai/dsh-scope` is loaded dynamically as an optional
+ * upgrade for scope-key views and degrades to the global registry view when
+ * absent.
  *
  * Persistence: the hidden set (plus a description cache for hidden tools) is
  * loaded on start and written on every change to `$DSH_HOME/tool-visibility.json`
@@ -74,37 +75,83 @@ export async function apply(ctx, config = {}) {
   /** Tool-name → description cache, kept for hidden tools so the UI can show them. */
   const descriptions = new Map();
   /**
-   * Tool-name → description cache built from every assembled prompt. The global
-   * registry view is NOT the whole catalog once tools live on more than one
-   * plane (the web surface mounts its model-facing rows inside per-session
-   * agent presets), so the assemble waterfall is the one view that sees every
-   * tool a model is actually offered (`assembly.tools` = the request's `tools`
-   * field). Observation is what lets the settings page list — and therefore
-   * toggle — those preset-plane tools.
+   * Live agents whose model context this plugin filters. `tools.restrict()`
+   * needs a scoped context, so each entry owns a restriction installed through
+   * `agent.ctx` — the per-agent control point dsh 0.2.2-rc.3 documents. The
+   * agent object is its own scope key (`createScope(loopCtx, agent)`), which is
+   * how the settings catalog reads that agent's view.
+   *
+   * @type {Map<object, {
+   *   agent: object,
+   *   desired: Set<string>,
+   *   installed: Set<string>,
+   *   lift: null | (() => void),
+   *   owned: null | (() => void),
+   * }>}
    */
-  const observed = new Map();
-  /** 'restrict' | 'waterfall' | 'none' — which filter actually applies. */
+  const tracked = new Map();
+  /**
+   * Tool-name → description seen in a live agent's view. The settings page keeps
+   * these so preset-plane tools stay listed after their agent closes, the way
+   * the previous in-memory assembly observation behaved.
+   */
+  const seen = new Map();
+  /** 'restrict' | 'none' — which filter actually applies. */
   let filterMode = 'none';
-  let lift = null; // disposer of the active registry restriction
 
   // Optional scope support: `@deepseek-ai/dsh-scope` is a dsh-install built-in,
   // present when the runtime loads our package from the same tree, but not
   // guaranteed for registry installs in foreign profiles. Absent → global view.
   let scopeOf = null;
+  let scopeChainOf = null;
   try {
-    scopeOf = (await import('@deepseek-ai/dsh-scope')).scopeOf;
+    const scope = await import('@deepseek-ai/dsh-scope');
+    scopeOf = scope.scopeOf;
+    scopeChainOf = scope.scopeChainOf;
   } catch {
     scopeOf = null;
   }
-  const scopeFor = (exec) => {
-    if (!scopeOf) return undefined;
+  /** Scope key under which this row itself is mounted (undefined at the root). */
+  const ownScope = scopeOf ? scopeOf(ctx) : undefined;
+  /** Whether an agent belongs to this row's mount scope (always true at the root). */
+  const inScope = (agent) => {
+    if (ownScope === undefined) return true;
+    if (!scopeOf || !scopeChainOf) return true;
     try {
-      if (exec && exec.agent) return scopeOf(exec.agent.ctx);
-      return scopeOf(ctx);
+      const agentScope = scopeOf(agent.ctx);
+      return agentScope !== undefined && scopeChainOf(agentScope).includes(ownScope);
     } catch {
-      return undefined;
+      return false;
     }
   };
+  /**
+   * Scope key for a tool-registry read. The Agent object is its own scope key;
+   * prefer the tagged key when `dsh-scope` is importable.
+   */
+  const scopeFor = (exec) => {
+    if (exec && exec.agent) {
+      if (scopeOf) {
+        try {
+          const key = scopeOf(exec.agent.ctx);
+          if (key !== undefined) return key;
+        } catch {
+          // Fall back to the agent object, which is the scope key in dsh 0.2.x.
+        }
+      }
+      return exec.agent;
+    }
+    return scopeOf ? scopeOf(ctx) : undefined;
+  };
+  /** One scope's model-facing schemas (empty when the registry view is unavailable). */
+  const schemasOf = (scope) => {
+    try {
+      return ctx.tools.schemas(scope);
+    } catch {
+      return [];
+    }
+  };
+  /** Current schemas one scope's model sees (post-restriction). */
+  const visibleSchemas = (exec) => schemasOf(scopeFor(exec));
 
   // ── persistence ────────────────────────────────────────────────────────────
   async function load() {
@@ -144,74 +191,163 @@ export async function apply(ctx, config = {}) {
     }
   }
 
-  // ── filtering ──────────────────────────────────────────────────────────────
-  // One `system-prompt/assemble` listener does both jobs: it records the tool
-  // schemas the model is about to be offered (the catalog's only complete
-  // source), and, when `restrict` is unusable from the mounting scope, it
-  // removes the hidden schemas from that same list. It is registered eagerly
-  // because recording must happen even while nothing is hidden — otherwise a
-  // tool that never appears in the global registry view could never be
-  // discovered by the UI, and so could never be hidden at all.
-  let waterfallRegistered = false;
-  const waterfall = async (assembly, _context, next) => {
-    for (const tool of Array.isArray(assembly?.tools) ? assembly.tools : []) {
-      if (tool !== null && typeof tool === 'object' && typeof tool.name === 'string') {
-        observed.set(tool.name, typeof tool.description === 'string' ? tool.description : '');
-      }
-    }
-    if (hidden.size === 0) return next();
-    const result = await next();
-    return { ...result, tools: result.tools.filter((tool) => !hidden.has(tool.name)) };
-  };
-  const ensureWaterfall = () => {
-    if (!waterfallRegistered) {
-      ctx.on('system-prompt/assemble', waterfall);
-      waterfallRegistered = true;
-    }
+  // ── filtering (per-agent `tools.restrict`) ─────────────────────────────────
+  // The restriction is a live registry layer, so one install covers every later
+  // step of that agent; it only has to be reconciled when `hidden` or the
+  // agent's tool set changes.
+  const hasRestriction = () => {
+    for (const entry of tracked.values()) if (entry.lift !== null) return true;
+    return false;
   };
 
-  /** (Re)apply the current hidden set as a registry restriction. */
-  function applyFilter() {
-    if (lift) {
-      lift();
-      lift = null;
+  /** Names this agent should deny: the hidden ones it can see or already denies. */
+  function desiredDeny(entry) {
+    const visible = new Set();
+    for (const schema of schemasOf(entry.agent)) {
+      visible.add(schema.name);
+      seen.set(schema.name, typeof schema.description === 'string' ? schema.description : '');
     }
-    const deny = [...hidden].filter((entry) => entry !== MANAGER_TOOL);
-    if (deny.length > 0) {
-      try {
-        lift = ctx.tools.restrict({ deny });
-        filterMode = 'restrict';
-        return;
-      } catch {
-        // Unscoped host mount, or a name this scope may not restrict: the
-        // assemble waterfall above carries the filter instead.
-      }
+    const desired = new Set();
+    for (const name of hidden) {
+      if (name === MANAGER_TOOL) continue;
+      if (entry.installed.has(name) || visible.has(name)) desired.add(name);
     }
-    filterMode = deny.length > 0 ? 'waterfall' : 'none';
+    return desired;
   }
 
-  // ── shared state helpers ───────────────────────────────────────────────────
-  /** Current schemas one scope's model sees (post-restriction). */
-  const visibleSchemas = (exec) => ctx.tools.schemas(scopeFor(exec));
+  function sameNames(a, b) {
+    if (a.size !== b.size) return false;
+    for (const name of a) if (!b.has(name)) return false;
+    return true;
+  }
 
   /**
-   * Complete tool catalog for the UI: visible schemas ∪ observed assemblies ∪
-   * hidden names.
+   * Reconcile one agent's restriction with `hidden`.
    *
-   * Two registries have to be merged back in, for two different reasons:
-   *  - hidden tools vanish from `schemas()` under `restrict` (and from the
-   *    assembled prompt), so the UI must restore them from the state cache or
-   *    they could never be re-shown;
+   * `restrict()` validates every name against the agent's restrictable set (the
+   * inherited global + preset tools), so one stale entry — another preset's
+   * tool, a scope-local tool, the reserved transport — must not drop the whole
+   * set: the batch is retried name by name and the unusable ones are skipped.
+   */
+  function refreshAgent(entry) {
+    const desired = desiredDeny(entry);
+    if (sameNames(desired, entry.desired)) return;
+    entry.desired = desired;
+    if (entry.lift !== null) {
+      entry.lift();
+      entry.lift = null;
+    }
+    const names = [...desired];
+    const disposers = [];
+    let installed = new Set();
+    if (names.length > 0) {
+      try {
+        disposers.push(entry.agent.ctx.tools.restrict({ deny: names }));
+        installed = new Set(names);
+      } catch {
+        for (const name of names) {
+          try {
+            disposers.push(entry.agent.ctx.tools.restrict({ deny: [name] }));
+            installed.add(name);
+          } catch {
+            // Not restrictable from this agent: leave it visible.
+          }
+        }
+      }
+    }
+    entry.installed = installed;
+    entry.lift = disposers.length === 0
+      ? null
+      : () => { for (const dispose of disposers.reverse()) dispose(); };
+  }
+
+  /** Reconcile every live agent and refresh the reported filter mode. */
+  function applyFilter() {
+    for (const entry of [...tracked.values()]) {
+      try {
+        refreshAgent(entry);
+      } catch (error) {
+        console.warn(`[${name}] cannot refresh the tool filter: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    filterMode = hasRestriction() ? 'restrict' : 'none';
+  }
+
+  /**
+   * Start filtering one agent. Both registrations are owned twice: disposing the
+   * agent removes the restriction through `agent.ctx.effect`, and the plugin
+   * keeps that disposer in its own effect so unloading the plugin also removes
+   * what it registered on `agent.ctx`.
+   */
+  function trackAgent(agent) {
+    if (tracked.has(agent)) return;
+    if (typeof agent?.ctx?.effect !== 'function' || typeof agent.ctx.tools?.restrict !== 'function') return;
+    const entry = { agent, desired: new Set(), installed: new Set(), lift: null, owned: null };
+    try {
+      entry.owned = agent.ctx.effect(() => () => {
+        if (entry.lift !== null) {
+          entry.lift();
+          entry.lift = null;
+        }
+        tracked.delete(entry.agent);
+      }, `${name}: agent filter`);
+      ctx.effect(() => () => {
+        const owned = entry.owned;
+        entry.owned = null;
+        tracked.delete(entry.agent);
+        if (typeof owned === 'function') owned();
+      }, `${name}: agent filter owner`);
+    } catch {
+      // The agent was already disposed, or its context cannot own effects.
+      return;
+    }
+    tracked.set(agent, entry);
+    try {
+      refreshAgent(entry);
+    } catch (error) {
+      console.warn(`[${name}] cannot filter this agent's tools: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // Late registrations (MCP servers, plugins loaded after this one) become
+  // restrictable only after they register, and `restrict()` accepts known names
+  // only — so a tool change schedules one coalesced reconcile.
+  let refreshScheduled = false;
+  const scheduleRefresh = () => {
+    if (refreshScheduled) return;
+    refreshScheduled = true;
+    queueMicrotask(() => {
+      refreshScheduled = false;
+      applyFilter();
+    });
+  };
+
+  // ── shared state helpers ───────────────────────────────────────────────────
+  /**
+   * Complete tool catalog for the UI: the mounting scope's visible schemas ∪
+   * every live agent's view ∪ the tools already seen on one ∪ hidden names.
+   *
+   * Three sources are merged back in, for two different reasons:
+   *  - hidden tools vanish from every registry view under `restrict`, so the UI
+   *    must restore them from the state cache or they could never be re-shown;
    *  - tools registered on another plane (an agent preset's own rows) never
    *    appear in the global registry view at all, so the only source for them
-   *    is what the assemble waterfall has seen the model being offered.
+   *    is a live agent's view (the agent object is that plane's scope key); the
+   *    `seen` cache keeps them listed after that agent closes.
    */
   const catalogFor = (exec) => {
     const byName = new Map();
-    for (const schema of visibleSchemas(exec)) {
+    const add = (schema) => {
       byName.set(schema.name, typeof schema.description === 'string' ? schema.description : '');
+    };
+    for (const schema of visibleSchemas(exec)) add(schema);
+    for (const entry of tracked.values()) {
+      for (const schema of schemasOf(entry.agent)) {
+        seen.set(schema.name, typeof schema.description === 'string' ? schema.description : '');
+        add(schema);
+      }
     }
-    for (const [name, description] of observed) {
+    for (const [name, description] of seen) {
       if (!byName.has(name)) byName.set(name, description);
     }
     for (const name of hidden) {
@@ -237,10 +373,9 @@ export async function apply(ctx, config = {}) {
   async function setHidden(name, hide, exec) {
     if (name === MANAGER_TOOL) return { error: `refusing to touch ${MANAGER_TOOL}` };
     if (hide) {
+      const known = catalogFor(exec).find((entry) => entry.name === name);
       hidden.add(name);
-      const schema = visibleSchemas(exec).find((entry) => entry.name === name);
-      const description = schema?.description ?? observed.get(name);
-      if (typeof description === 'string') descriptions.set(name, description);
+      if (typeof known?.description === 'string') descriptions.set(name, known.description);
     } else {
       hidden.delete(name);
       descriptions.delete(name);
@@ -344,7 +479,7 @@ export async function apply(ctx, config = {}) {
   //
   // The route is registered here rather than through `connection.rpc.handle`
   // because that helper resolves `webServer` through the *channel service's*
-  // own context, which never injects it (`cannot get property "webServer"
+  // own context, which never injects it (`cannot get property "webServer
   // without inject`). The wire envelope below is the same Connection RPC
   // contract the browser half sends through `ctx.connection.rpc.call`.
   ctx.inject(['connection', 'webServer'], (webCtx) => {
@@ -476,9 +611,29 @@ export async function apply(ctx, config = {}) {
   });
 
   // ── start with persisted state ─────────────────────────────────────────────
-  // The assemble listener is registered before any state exists: it is the
-  // catalog's only source for tools registered outside the global view.
-  ensureWaterfall();
   await load();
+
+  // The restriction needs a scoped context, so it is installed on each agent as
+  // soon as the agent exists. Event admission keeps a preset-mounted row to that
+  // preset's agents; the root-mounted bundle row receives them all.
+  ctx.on('agent/created', ({ agent }) => {
+    try {
+      if (inScope(agent)) trackAgent(agent);
+    } catch (error) {
+      console.warn(`[${name}] cannot filter agent tools: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  ctx.on('tools/change', scheduleRefresh);
+
+  // Agents that already exist when this row (re)loads get the same treatment.
+  try {
+    const agents = ctx.get('agents');
+    if (agents !== undefined && typeof agents.list === 'function') {
+      for (const agent of agents.list()) if (inScope(agent)) trackAgent(agent);
+    }
+  } catch {
+    // No agent registry in this composition: nothing to filter yet.
+  }
+
   applyFilter();
 }

@@ -11,31 +11,31 @@
 
 ## 原理
 
-每步模型调用前，agent loop 通过 `systemPrompt.assemble()` 收集工具 schema（来自
-`tools.schemas(scope)`），`assembly.tools` 即模型请求的 `tools` 字段。
+dsh 0.2.2-rc.3 起，`system-prompt/assemble` waterfall **不再携带工具清单**（工具声明由 provider
+拥有，在 waterfall 之后才附加），且 `ctx.tools.restrict()` 只接受 **scoped context**。因此本插件
+在每个存活 agent 的 context 上注册 restriction：
 
-本插件按优先级使用两种机制：
+1. **`ctx.tools.restrict({ deny })`**（框架原生，唯一过滤机制）——通过 `agent/created` 事件拿到
+   `agent.ctx`，把 restriction 注册在 agent 这一层。它对该 agent 可见的全局工具与 agent-preset
+   工具同时生效：被隐藏的 schema 不再注入上下文，调用会得到 `UNKNOWN_TOOL`。
+2. **生命周期双重归属**——restriction 用 `agent.ctx.effect()` 绑定 agent，同时把这枚 disposer
+   挂进插件自己的 effect：agent 释放或插件卸载，任意一侧都能清干净。
+3. **挂载 scope 决定过滤范围**——事件派发按 scope 过滤：根组合层的 bundle 行收到所有 agent，
+   作为某个 agent preset 的一行挂载时只收到该 preset 下的 agent。
+4. **对齐时机**——`hidden` 变化时对已跟踪 agent 重新对齐；`tools/change`（工具后注册，如 MCP）
+   触发一次合并刷新，因为 `restrict()` 只能点名「安装时已存在」的工具。名字逐条校验：某个名字
+   不可 restrict（别的 preset 的工具、scope-local 工具、保留的 `run_code`）不会连累其它名字。
 
-1. **`ctx.tools.restrict({ deny })`**（首选，框架原生）——作为 agent preset 行挂载时，
-   restriction 注册在 preset scope，对本 preset 下的所有 agent 生效：被隐藏的工具 schema
-   不再注入上下文，且调用会得到 `UNKNOWN_TOOL`。
-2. **`system-prompt/assemble` waterfall**——**始终注册**。它承担两件事：
-   - 记录 `assembly.tools`（模型真正会看到的 schema 清单），这是设置页目录的**唯一完整来源**；
-   - 当 `restrict` 不可用时（例如本组合包 patch 把行插在无 scope 的 host 根层）剔除隐藏
-     schema（仅影响模型所见，不阻止执行）。
-
-   之所以要“始终注册”：dsh 0.2.0 起 web profile 把模型侧工具行（`tool-pwsh` / `tool-fs` /
-   `tool-fs-search` / `tool-skill` …）**移进了每会话的 agent preset**，根层挂载时
-   `tools.schemas()`（全局视图）看不到它们；而 waterfall 对任意 scope 的 assembly 都可见
-   （未打 scope 标签的 listener 接收全部子 scope 事件）。没有这一步，设置页就永远列不出这些
-   工具，也就永远无法开关它们。
+设置页目录 = 当前挂载 scope 的 `tools.schemas()` ∪ 每个存活 agent 的 `tools.schemas(agent)`
+（agent 对象本身就是它的 scope key，这一项才看得到 preset 层工具；见过的工具会留在内存目录里，
+agent 关闭后仍可开关）∪ 持久化的隐藏集合与其描述缓存。
 
 `tool_visibility` 工具自身永远不可隐藏（否则会失去控制权）。
 
 ## 表面（Surface）
 
-- **浏览器设置页**：Settings → 工具注入控制。列出全部工具（全局视图 ∪ 组装观测 ∪ 已隐藏，
-  隐藏的也能恢复），复选框逐工具开关；按名称前缀分组、支持搜索与整组批量开关；
+- **浏览器设置页**：Settings → 工具注入控制。列出全部工具（挂载 scope 视图 ∪ 存活 agent 视图 ∪
+  已隐藏，隐藏的也能恢复），复选框逐工具开关；按名称前缀分组、支持搜索与整组批量开关；
   顶部有 刷新 / 全部恢复；显示状态文件路径与当前生效的过滤机制。
   Client↔Host 走 Connection RPC 通道 `/tool-visibility`（endpoints: `list` / `set` / `set-group` / `reset`）。
   > 兼容性：`connection.rpc.handle()` 是框架内部通道实现，第三方插件调用时它会用**通道服务自身的
@@ -45,18 +45,18 @@
   > 前缀路由，复用 `connection.requestRejection()` 的 Host/Origin + 浏览器会话校验；
   > 报文仍是标准 Connection RPC 信封（`client-request` / `server-response`），client 半区无需改动。
 - **模型工具** `tool_visibility`：`list` / `hide` / `show` / `reset`。该工具按调用者 agent 的
-  scope 解析可见工具，因此在 preset 行挂载时天然是 per-agent 视图。
-- **设置页目录来源**（按合并顺序）：`tools.schemas()`（当前挂载 scope 的注册表视图）→
-  waterfall 观测到的 assembly 工具（含 preset 层，**仅内存**）→ 持久化的隐藏集合与其描述缓存。
+  scope 解析可见工具（根层 / preset 行挂载都按 agent 视图），因此天然是 per-agent 语义。
+- **设置页目录来源**（按合并顺序）：当前挂载 scope 的 `tools.schemas()` → 每个存活 agent 的
+  `tools.schemas(agent)`（含 preset 层工具，仅内存）→ 持久化的隐藏集合与其描述缓存。
 
 ## 安装 / 挂载
 
 **组合包（bundle）安装**：`cordis.patch.yml` 把本插件的行插在 profile 的**根组合层**
-（host 层）。根层没有 scope，`restrict` 必然抛错（框架明确要求 scoped context），插件自动
-降级为上面第 2 条 waterfall：隐藏的工具不再注入模型上下文，但**仍可被调用**。
-持久化、设置页、模型工具在根层全部照常工作。
+（host 层）。根层本身不能注册 restriction，插件会等每个 agent 出现后在其 `agent.ctx` 上注册，
+因此根层挂载同样具备完整语义（隐藏即不注入、且调用得到 `UNKNOWN_TOOL`）。持久化、设置页、
+模型工具在根层全部照常工作。
 
-作为 agent preset 的一行（可选，获得 per-scope 过滤 + `UNKNOWN_TOOL` 语义）：
+作为 agent preset 的一行（可选，把过滤范围收敛到该 preset 下的 agent）：
 
 ```yaml
 # 在 <preset>/agent.cordis.yml 中追加（需先安装本包：dsh plugin add @rayfalling/dsh-tool-visibility）
@@ -64,19 +64,25 @@
   name: '@rayfalling/dsh-tool-visibility'
 ```
 
+> 0.3.5 及更早把根层挂载降级成 `system-prompt/assemble` waterfall 过滤；dsh 0.2.2-rc.3 的
+> waterfall 不再提供工具数组，该写法已删除（它会抛
+> `Cannot read properties of undefined (reading 'filter')`）。
+
 Client 半区由 web 端 `dsh.client` 表自动发现（`package.json` 的 `dsh.client` 字段 +
 `./client` 出口）；`src/client.js` 即 `__ModuleLoader__` 格式的浏览器 bundle，**无需构建**。
 
 ## 版本兼容
 
-- **0.3.5+（当前）**：适配 dsh **0.2.0-rc.2**。`peerDependencies` 里的 `@deepseek-ai/dsh-*`
-  统一改成 **下限开区间**（`>=0.1.5-rc.2`），因为插件的 host 入口零静态 `@deepseek-ai/*`
-  import、只消费注入服务；旧的 `^0.1.5-rc.2`（0.x 语义 = `>=0.1.5-rc.2 <0.2.0`）会让
-  dsh 0.2.0-rc.2 的兼容性闸门直接跳过整个 bundle：
-  `skipping profile bundle … is incompatible with dsh 0.2.0-rc.2`。
-  另外补上 dsh 0.2.0 的 agent-preset 工具面适配（见「原理」第 2 条的 assembly 观测）。
+- **0.4.0+（当前）**：适配 dsh **0.2.2-rc.3**（桌面 App 0.2.2-rc.3 / `@deepseek-ai/*` 0.2.2-rc.3 /
+  cordis 4.1.0）。过滤机制改为 per-agent `ctx.tools.restrict()`（见「原理」）：0.2.2-rc.3 的
+  `system-prompt/assemble` waterfall 不再携带 `tools`，根层 `restrict()` 也会被拒绝。
+  `peerDependencies` 的下限开区间不用改（`>=0.1.5-rc.2` 接受 0.2.2-rc.3，`^4.0.2` 接受 4.1.0）。
+- **0.3.5**：适配 dsh **0.2.0-rc.2**（peer 下限开区间 + waterfall 观测 preset 层工具）。在
+  dsh ≥ 0.2.2-rc.3 上：`hidden` 非空时每个模型步都会抛
+  `Cannot read properties of undefined (reading 'filter')`；`hidden` 为空则过滤完全失效。
+  请升级到 0.4.0+。
 - **0.3.4 及更早**：只声明到 `^0.1.5-rc.2`，在 dsh ≥ 0.2.0 上会被闸门跳过（插件完全不加载），
-  且设置页目录看不到 preset 层工具。请升级到 0.3.5+。
+  且设置页目录看不到 preset 层工具。请升级到 0.4.0+。
 
 ## 持久化
 
